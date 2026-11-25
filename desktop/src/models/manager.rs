@@ -62,19 +62,20 @@ impl ManagerClass {
                     continue;
                 }
 
-                // Center containment check
+                // Strict containment OR proportional enclosure (tolerates sticking out up to 55%)
+                let strictly_inside = parent_box.contains_rect(&child_box);
                 let center_inside = parent_box.contains_point(child_center);
 
-                // Overlap ratio check
                 let overlap_area = parent_box
                     .intersection(&child_box)
                     .map(|r| r.area())
                     .unwrap_or(0.0);
                 let overlap_ratio = overlap_area / child_area;
 
-                // Threshold: If center is inside and >= 65% overlap, it is inside the container
-                // If small box is sticking out significantly (< 50% overlap), it's outside
-                if center_inside && overlap_ratio >= 0.65 {
+                if strictly_inside
+                    || (center_inside && overlap_ratio >= 0.45)
+                    || overlap_ratio >= 0.50
+                {
                     if parent_area < smallest_parent_area {
                         smallest_parent_area = parent_area;
                         best_parent_idx = Some(p_idx);
@@ -87,33 +88,84 @@ impl ManagerClass {
             }
         }
 
-        // Compute manager hashes (outermost ancestor container)
-        // Map child_id -> parent_id
-        let id_to_parent: HashMap<ElementId, ElementId> = elements
-            .iter()
-            .filter_map(|e| e.parent_id.as_ref().map(|p| (e.id.clone(), p.clone())))
-            .collect();
-
-        for el in elements.iter_mut() {
-            if let Some(mut current_parent) = el.parent_id.clone() {
-                let mut visited = HashSet::new();
-                visited.insert(el.id.clone());
-
-                let mut outermost = current_parent.clone();
-                while let Some(next_parent) = id_to_parent.get(&current_parent) {
-                    if !visited.insert(next_parent.clone()) {
-                        break; // Prevent cycle
-                    }
-                    outermost = next_parent.clone();
-                    current_parent = next_parent.clone();
-                }
-                let hash_prefix = if outermost.as_str().len() >= 10 {
-                    &outermost.as_str()[..10]
-                } else {
-                    outermost.as_str()
-                };
-                el.manager_hash = Some(format!("mgr_{}", hash_prefix));
+        // Build parent -> children indices mapping
+        let mut children_indices: HashMap<ElementId, Vec<usize>> = HashMap::new();
+        for (idx, el) in elements.iter().enumerate() {
+            if let Some(pid) = &el.parent_id {
+                children_indices.entry(pid.clone()).or_default().push(idx);
             }
+        }
+
+        // Helper: does an element's subtree contain at least one child polygon/container?
+        fn subtree_has_child_polygon(
+            el_id: &ElementId,
+            elements: &[CommonObject],
+            children_map: &HashMap<ElementId, Vec<usize>>,
+        ) -> bool {
+            if let Some(children) = children_map.get(el_id) {
+                for &c_idx in children {
+                    let child = &elements[c_idx];
+                    match child.kind {
+                        ShapeKind::Rectangle { .. }
+                        | ShapeKind::Polygon { .. }
+                        | ShapeKind::Ellipse { .. } => return true,
+                        _ => {
+                            if subtree_has_child_polygon(&child.id, elements, children_map) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        // Outermost Manager Rule:
+        // A root element is designated as ManagerClass ONLY IF:
+        // 1. It is a container (Rectangle, Polygon, or Ellipse).
+        // 2. Its subtree contains at least one child polygon (Text/Arrow alone do NOT trigger manager status).
+        let mut manager_hashes: HashMap<ElementId, String> = HashMap::new();
+        for el in elements.iter() {
+            if el.parent_id.is_none() {
+                let is_container = matches!(
+                    el.kind,
+                    ShapeKind::Rectangle { .. }
+                        | ShapeKind::Polygon { .. }
+                        | ShapeKind::Ellipse { .. }
+                );
+                if is_container && subtree_has_child_polygon(&el.id, elements, &children_indices) {
+                    let id_str = el.id.as_str();
+                    let prefix = if id_str.len() >= 10 {
+                        &id_str[..10]
+                    } else {
+                        id_str
+                    };
+                    manager_hashes.insert(el.id.clone(), format!("mgr_{}", prefix));
+                }
+            }
+        }
+
+        // Propagate manager hash to the manager itself AND all its descendants
+        for (mgr_id, hash) in &manager_hashes {
+            if let Some(mgr_el) = elements.iter_mut().find(|e| &e.id == mgr_id) {
+                mgr_el.manager_hash = Some(hash.clone());
+            }
+
+            fn apply_hash_to_descendants(
+                parent_id: &ElementId,
+                hash: &str,
+                elements: &mut [CommonObject],
+                children_map: &HashMap<ElementId, Vec<usize>>,
+            ) {
+                if let Some(children) = children_map.get(parent_id) {
+                    for &c_idx in children {
+                        let child_id = elements[c_idx].id.clone();
+                        elements[c_idx].manager_hash = Some(hash.to_string());
+                        apply_hash_to_descendants(&child_id, hash, elements, children_map);
+                    }
+                }
+            }
+            apply_hash_to_descendants(mgr_id, hash, elements, &children_indices);
         }
 
         // Finally, topologically sort so parents are always rendered behind their children
@@ -196,11 +248,6 @@ impl ManagerClass {
 
     /// Build hierarchy tree model for the right-side tree visualization
     pub fn build_hierarchy_tree(elements: &[CommonObject]) -> Vec<HierarchyNode> {
-        let parent_set: HashSet<ElementId> = elements
-            .iter()
-            .filter_map(|e| e.parent_id.clone())
-            .collect();
-
         let mut children_map: HashMap<Option<ElementId>, Vec<&CommonObject>> = HashMap::new();
         for el in elements {
             children_map
@@ -212,10 +259,9 @@ impl ManagerClass {
         fn build_subtree(
             el: &CommonObject,
             children_map: &HashMap<Option<ElementId>, Vec<&CommonObject>>,
-            parent_set: &HashSet<ElementId>,
             is_root: bool,
         ) -> HierarchyNode {
-            let is_manager = parent_set.contains(&el.id);
+            let is_manager = is_root && el.manager_hash.is_some();
             let mut node = HierarchyNode {
                 id: el.id.clone(),
                 type_name: el.type_name(),
@@ -227,7 +273,7 @@ impl ManagerClass {
             if let Some(children) = children_map.get(&Some(el.id.clone())) {
                 for child in children {
                     node.children
-                        .push(build_subtree(child, children_map, parent_set, false));
+                        .push(build_subtree(child, children_map, false));
                 }
             }
 
@@ -237,7 +283,7 @@ impl ManagerClass {
         let mut tree = Vec::new();
         if let Some(roots) = children_map.get(&None) {
             for root in roots {
-                tree.push(build_subtree(root, &children_map, &parent_set, true));
+                tree.push(build_subtree(root, &children_map, true));
             }
         }
 

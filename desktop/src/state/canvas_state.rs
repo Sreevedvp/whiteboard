@@ -134,6 +134,16 @@ impl CanvasState {
         self.editing_text_id = None;
     }
 
+    /// Recursively collects all descendants of an element into a set
+    pub fn collect_all_descendants(&self, parent_id: &ElementId, set: &mut HashSet<ElementId>) {
+        for el in &self.elements {
+            if el.parent_id.as_ref() == Some(parent_id) && !set.contains(&el.id) {
+                set.insert(el.id.clone());
+                self.collect_all_descendants(&el.id, set);
+            }
+        }
+    }
+
     /// Find top-most element at canvas coordinate
     pub fn hit_test_element(&self, pt: Point2D) -> Option<&CommonObject> {
         // Iterate backwards from highest z_index (front) to lowest (back)
@@ -203,12 +213,25 @@ impl CanvasState {
             },
         };
 
-        if let Some(pos) = self.elements.iter().position(|e| e.id == id) {
-            let el = self.elements.remove(pos);
-            self.elements.push(el);
-            self.recalculate_hierarchy();
-            self.is_dirty = true;
+        let mut target_set = HashSet::new();
+        target_set.insert(id.clone());
+        self.collect_all_descendants(&id, &mut target_set);
+
+        let mut targets = Vec::new();
+        let mut others = Vec::new();
+
+        for el in self.elements.drain(..) {
+            if target_set.contains(&el.id) {
+                targets.push(el);
+            } else {
+                others.push(el);
+            }
         }
+
+        self.elements = others;
+        self.elements.extend(targets);
+        self.recalculate_hierarchy();
+        self.is_dirty = true;
     }
 
     pub fn send_to_back(&mut self, target_id: Option<&ElementId>) {
@@ -220,12 +243,26 @@ impl CanvasState {
             },
         };
 
-        if let Some(pos) = self.elements.iter().position(|e| e.id == id) {
-            let el = self.elements.remove(pos);
-            self.elements.insert(0, el);
-            self.recalculate_hierarchy();
-            self.is_dirty = true;
+        let mut target_set = HashSet::new();
+        target_set.insert(id.clone());
+        self.collect_all_descendants(&id, &mut target_set);
+
+        let mut targets = Vec::new();
+        let mut others = Vec::new();
+
+        for el in self.elements.drain(..) {
+            if target_set.contains(&el.id) {
+                targets.push(el);
+            } else {
+                others.push(el);
+            }
         }
+
+        let mut combined = targets;
+        combined.extend(others);
+        self.elements = combined;
+        self.recalculate_hierarchy();
+        self.is_dirty = true;
     }
 
     pub fn bring_forward(&mut self, target_id: Option<&ElementId>) {

@@ -12,7 +12,7 @@ use gpui::{
     CursorStyle, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Render,
     ScrollWheelEvent, SharedString, Window,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct WhiteboardView {
     pub state: CanvasState,
@@ -169,11 +169,15 @@ impl WhiteboardView {
                 // Check if user clicked an element
                 if let Some(el) = self.state.hit_test_element(mouse_canvas) {
                     let id = el.id.clone();
-                    self.state.select_only(id);
+                    self.state.select_only(id.clone());
+
+                    let mut move_ids = HashSet::new();
+                    move_ids.insert(id.clone());
+                    self.state.collect_all_descendants(&id, &mut move_ids);
 
                     let mut initial_positions = HashMap::new();
-                    for sel_id in &self.state.selected_ids {
-                        if let Some(e) = self.state.elements.iter().find(|e| &e.id == sel_id) {
+                    for m_id in &move_ids {
+                        if let Some(e) = self.state.elements.iter().find(|e| &e.id == m_id) {
                             initial_positions.insert(e.id.clone(), e.bounds);
                         }
                     }
@@ -254,7 +258,6 @@ impl WhiteboardView {
                         el.translate(delta);
                     }
                 }
-                self.state.recalculate_hierarchy();
                 self.state.is_dirty = true;
                 self.state.hover_cursor = CursorStyle::PointingHand;
                 cx.notify();
@@ -317,6 +320,12 @@ impl WhiteboardView {
             let id = self.state.add_element(new_el);
             self.state.select_only(id);
             self.state.active_tool = Tool::Select;
+            self.auto_save();
+        } else if matches!(
+            self.state.drag_mode,
+            DragMode::Dragging { .. } | DragMode::Resizing { .. }
+        ) {
+            self.state.recalculate_hierarchy();
             self.auto_save();
         } else if self.state.is_dirty {
             self.auto_save();
@@ -1036,17 +1045,23 @@ impl WhiteboardView {
                             .py_0p5()
                             .rounded_md()
                             .text_xs()
-                            .bg(if is_root {
+                            .bg(if is_root && el.manager_hash.is_some() {
+                                Theme::BADGE_MANAGER_BG
+                            } else if is_root {
                                 Theme::BADGE_ROOT_BG
                             } else {
                                 Theme::BADGE_CHILD_BG
                             })
-                            .text_color(if is_root {
+                            .text_color(if is_root && el.manager_hash.is_some() {
+                                Theme::BADGE_MANAGER_TEXT
+                            } else if is_root {
                                 Theme::BADGE_ROOT_TEXT
                             } else {
                                 Theme::BADGE_CHILD_TEXT
                             })
-                            .child(if is_root {
+                            .child(if is_root && el.manager_hash.is_some() {
+                                "MANAGER INSTANCE"
+                            } else if is_root {
                                 "ROOT INSTANCE"
                             } else {
                                 "CHILD INSTANCE"
@@ -1503,17 +1518,27 @@ impl WhiteboardView {
                             .py_0p5()
                             .rounded_sm()
                             .text_xs()
-                            .bg(if node.is_root {
+                            .bg(if node.is_manager {
+                                Theme::BADGE_MANAGER_BG
+                            } else if node.is_root {
                                 Theme::BADGE_ROOT_BG
                             } else {
                                 Theme::BADGE_CHILD_BG
                             })
-                            .text_color(if node.is_root {
+                            .text_color(if node.is_manager {
+                                Theme::BADGE_MANAGER_TEXT
+                            } else if node.is_root {
                                 Theme::BADGE_ROOT_TEXT
                             } else {
                                 Theme::BADGE_CHILD_TEXT
                             })
-                            .child(if node.is_root { "ROOT" } else { "CHILD" }),
+                            .child(if node.is_manager {
+                                "MANAGER"
+                            } else if node.is_root {
+                                "ROOT"
+                            } else {
+                                "CHILD"
+                            }),
                     ),
             )
             .children(
